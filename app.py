@@ -2,6 +2,7 @@ from flask import Flask, request, jsonify, render_template_string
 import joblib
 import numpy as np
 import os
+import traceback
 
 app = Flask(__name__)
 
@@ -115,38 +116,40 @@ def health():
 
 @app.post("/predict")
 def predict():
-    """
-    Accepts either:
-      (1) JSON dict of feature_name -> value
-          { "fixed acidity": 7.4, ... }
-      (2) JSON with a list in correct order:
-          { "features": [7.4, 0.7, ...] }
-    """
-    payload = request.get_json(silent=True) or {}
+    try:
+        payload = request.get_json(silent=True) or {}
 
-    # Case (2): {"features": [...]}
-    if isinstance(payload, dict) and "features" in payload:
-        feats = payload["features"]
-        if not isinstance(feats, list) or len(feats) != len(FEATURES):
-            return jsonify({"detail": f"'features' must be a list of length {len(FEATURES)}"}), 400
-        x = np.array([feats], dtype=float)
+        # Case (2): {"features": [...]}
+        if isinstance(payload, dict) and "features" in payload:
+            feats = payload["features"]
+            if not isinstance(feats, list) or len(feats) != len(FEATURES):
+                return jsonify({"detail": f"'features' must be a list of length {len(FEATURES)}"}), 400
+            x = np.array([feats], dtype=float)
 
-    # Case (1): {"fixed acidity": ..., ...}
-    elif isinstance(payload, dict):
-        missing = [f for f in FEATURES if f not in payload]
-        if missing:
-            return jsonify({"detail": f"Missing features: {missing}"}), 400
-        x = np.array([[float(payload[f]) for f in FEATURES]], dtype=float)
+        # Case (1): {"fixed acidity": ..., ...}
+        elif isinstance(payload, dict):
+            missing = [f for f in FEATURES if f not in payload]
+            if missing:
+                return jsonify({"detail": f"Missing features: {missing}"}), 400
+            x = np.array([[float(payload[f]) for f in FEATURES]], dtype=float)
 
-    else:
-        return jsonify({"detail": "Invalid JSON payload"}), 400
+        else:
+            return jsonify({"detail": "Invalid JSON payload"}), 400
 
-    pred = float(model.predict(x)[0])
-    return jsonify({
-        "predicted_quality": round(pred, 4),
-        "rounded_quality": int(round(pred)),
-        "feature_order": FEATURES
-    })
+        pred = float(model.predict(x)[0])
+        return jsonify({
+            "predicted_quality": round(pred, 4),
+            "rounded_quality": int(round(pred)),
+            "feature_order": FEATURES
+        })
+
+    except Exception as e:
+        # This will print into Heroku logs AND return the traceback to curl/browser
+        app.logger.exception("Predict failed")
+        return jsonify({
+            "detail": str(e),
+            "trace": traceback.format_exc()
+        }), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
