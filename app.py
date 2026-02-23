@@ -21,7 +21,15 @@ FEATURES = [
 ]
 
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join("artifacts", "wine_lr.joblib"))
-model = joblib.load(MODEL_PATH)
+loaded = joblib.load(MODEL_PATH)
+
+if isinstance(loaded, dict):
+    model = loaded["model"]
+    # Use the feature order saved with the model (important!)
+    if "features" in loaded and isinstance(loaded["features"], list):
+        FEATURES = loaded["features"]
+else:
+    model = loaded
 
 HTML = """
 <!doctype html>
