@@ -2,11 +2,11 @@ from flask import Flask, request, jsonify, render_template_string
 import joblib
 import numpy as np
 import os
-import traceback
 
 app = Flask(__name__)
 
-FEATURES = [
+# Default feature list (used only if the artifact doesn't provide it)
+DEFAULT_FEATURES = [
     "fixed acidity",
     "volatile acidity",
     "citric acid",
@@ -21,15 +21,58 @@ FEATURES = [
 ]
 
 MODEL_PATH = os.getenv("MODEL_PATH", os.path.join("artifacts", "wine_lr.joblib"))
+
+# --- Load model artifact ---
 loaded = joblib.load(MODEL_PATH)
 
 if isinstance(loaded, dict):
+    # Your artifact format: {"model": LinearRegression(), "features": [...]}
     model = loaded["model"]
-    # Use the feature order saved with the model (important!)
-    if "features" in loaded and isinstance(loaded["features"], list):
-        FEATURES = loaded["features"]
+    FEATURES = loaded.get("features", DEFAULT_FEATURES)
 else:
     model = loaded
+    FEATURES = DEFAULT_FEATURES
+
+# Build helper maps to accept multiple naming styles
+# Canonical names are exactly what's in FEATURES
+LOWER_FEATURE_MAP = {f.lower(): f for f in FEATURES}
+CANONICAL_SET = set(FEATURES)
+
+def normalize_payload_keys(payload: dict) -> dict:
+    """
+    Accept keys in multiple forms:
+      - exact canonical name
+      - spaces -> underscores (and '-' -> '_')
+      - case-insensitive matching
+    Returns dict with canonical feature names.
+    """
+    normalized = {}
+
+    for k, v in payload.items():
+        if not isinstance(k, str):
+            continue
+
+        # If it's already canonical, keep it
+        if k in CANONICAL_SET:
+            normalized[k] = v
+            continue
+
+        # Convert common variants: spaces/dashes -> underscores
+        k2 = k.strip().replace(" ", "_").replace("-", "_")
+
+        # If canonical features use underscores
+        if k2 in CANONICAL_SET:
+            normalized[k2] = v
+            continue
+
+        # Case-insensitive matching (supports pH/ph, etc.)
+        k3 = k2.lower()
+        if k3 in LOWER_FEATURE_MAP:
+            normalized[LOWER_FEATURE_MAP[k3]] = v
+            continue
+
+    return normalized
+
 
 HTML = """
 <!doctype html>
@@ -60,8 +103,8 @@ HTML = """
       <div class="grid">
         {% for f in features %}
           <div>
-            <label for="{{f}}">{{f}}</label>
-            <input type="number" step="any" id="{{f}}" name="{{f}}" required placeholder="e.g. 7.4"/>
+            <label for="{{ ids[f] }}">{{ f }}</label>
+            <input type="number" step="any" id="{{ ids[f] }}" name="{{ ids[f] }}" required placeholder="e.g. 7.4"/>
           </div>
         {% endfor %}
       </div>
@@ -77,7 +120,10 @@ HTML = """
   </div>
 
 <script>
+  // Use safe IDs (no spaces) but send canonical feature names back to the server
   const FEATURES = {{ features | tojson }};
+  const ID_MAP = {{ ids | tojson }};
+
   const form = document.getElementById("predictForm");
   const resultEl = document.getElementById("result");
   const rawEl = document.getElementById("raw");
@@ -89,7 +135,8 @@ HTML = """
 
     const payload = {};
     for (const f of FEATURES) {
-      const val = document.getElementById(f).value;
+      const id = ID_MAP[f];
+      const val = document.getElementById(id).value;
       payload[f] = Number(val);
     }
 
@@ -114,35 +161,56 @@ HTML = """
 </html>
 """
 
+
 @app.get("/")
 def index():
-    return render_template_string(HTML, features=FEATURES)
+    # HTML element IDs should not contain spaces.
+    # Create safe IDs but keep canonical feature names for payload.
+    ids = {f: f.replace(" ", "_").replace("-", "_") for f in FEATURES}
+    return render_template_string(HTML, features=FEATURES, ids=ids)
+
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "model_path": MODEL_PATH})
+    ok = hasattr(model, "predict")
+    return jsonify({
+        "status": "ok" if ok else "bad",
+        "model_path": MODEL_PATH,
+        "model_type": str(type(model)),
+        "feature_order": FEATURES,
+    })
+
 
 @app.post("/predict")
 def predict():
     try:
-        payload = request.get_json(silent=True) or {}
+        payload = request.get_json(silent=True)
+        if payload is None:
+            return jsonify({"detail": "Missing or invalid JSON body"}), 400
 
-        # Case (2): {"features": [...]}
+        # Option A: {"features": [..]} in correct order (FEATURES)
         if isinstance(payload, dict) and "features" in payload:
             feats = payload["features"]
             if not isinstance(feats, list) or len(feats) != len(FEATURES):
                 return jsonify({"detail": f"'features' must be a list of length {len(FEATURES)}"}), 400
             x = np.array([feats], dtype=float)
 
-        # Case (1): {"fixed acidity": ..., ...}
+        # Option B: {"fixed acidity": ..., ...} (accepts spaces or underscores)
         elif isinstance(payload, dict):
-            missing = [f for f in FEATURES if f not in payload]
+            normalized = normalize_payload_keys(payload)
+            missing = [f for f in FEATURES if f not in normalized]
             if missing:
-                return jsonify({"detail": f"Missing features: {missing}"}), 400
-            x = np.array([[float(payload[f]) for f in FEATURES]], dtype=float)
+                return jsonify({
+                    "detail": f"Missing features: {missing}",
+                    "expected_features": FEATURES
+                }), 400
+            x = np.array([[float(normalized[f]) for f in FEATURES]], dtype=float)
 
         else:
-            return jsonify({"detail": "Invalid JSON payload"}), 400
+            return jsonify({"detail": "JSON payload must be an object"}), 400
+
+        if not hasattr(model, "predict"):
+            return jsonify({"detail": f"Loaded model has no predict(): {type(model)}"}), 500
 
         pred = float(model.predict(x)[0])
         return jsonify({
@@ -152,12 +220,9 @@ def predict():
         })
 
     except Exception as e:
-        # This will print into Heroku logs AND return the traceback to curl/browser
-        app.logger.exception("Predict failed")
-        return jsonify({
-            "detail": str(e),
-            "trace": traceback.format_exc()
-        }), 500
+        # Return JSON error (prevents HTML 500 pages and keeps the UI readable)
+        return jsonify({"detail": str(e)}), 500
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
