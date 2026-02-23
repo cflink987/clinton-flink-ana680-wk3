@@ -41,3 +41,11 @@ def predict():
     x = np.array([[float(data[f]) for f in FEATURES]], dtype=float)
     pred = float(model.predict(x)[0])
     return jsonify({"prediction": pred})
+
+@app.get("/")
+def index():
+    return (
+        "Wine Quality Predictor is running ✅\n"
+        "Use POST /predict with JSON to get a prediction.\n"
+    )
+
